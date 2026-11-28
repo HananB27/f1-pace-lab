@@ -1,0 +1,169 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+  svg { display: block; width: 100%; }
+  .label { fill: #e8e9ec; font-family: system-ui, -apple-system, sans-serif; font-weight: 700;
+           paint-order: stroke; stroke: #0b0c10; text-anchor: middle; pointer-events: none; }
+  .empty { fill: #9aa0ab; font-family: system-ui, sans-serif; text-anchor: middle; }
+</style>
+</head>
+<body>
+<svg id="map" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet"></svg>
+<script>
+// Animated track map for F1 Pace Lab.
+//
+// Streamlit sends a window of car position samples (OpenF1 records ~3.7 per
+// car per second) plus the current playhead and playback rate. This page moves
+// the playhead itself on every animation frame and interpolates each car
+// between samples, so cars glide instead of jumping on each server refresh.
+// Talks to Streamlit with the custom-component postMessage protocol.
+
+const NS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("map");
+const trackLayer = document.createElementNS(NS, "g");
+const carLayer = document.createElementNS(NS, "g");
+svg.append(trackLayer, carLayer);
+
+let outlineKey = null;
+let span = 10000;             // size of the track in data units, for scaling marks
+let cars = {};                // driver -> {t: [], x: [], y: []}
+let meta = {};                // driver -> {label, colour, pos}
+let els = {};                 // driver -> {g, label}
+let playhead = 0;             // seconds since session start
+let rate = 0;                 // seconds of session per real second
+let adjust = 1;               // small rate correction to drift back to the server clock
+let horizon = 0;              // last moment we have samples for
+let seekId = null;
+let height = 0;
+let last = performance.now();
+
+function post(type, extra) {
+  window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type }, extra || {}), "*");
+}
+
+function el(name, attrs, parent) {
+  const node = document.createElementNS(NS, name);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+  if (parent) parent.appendChild(node);
+  return node;
+}
+
+function setOutline(outline) {
+  trackLayer.replaceChildren();
+  const xs = outline.x, ys = outline.y.map(v => -v);   // SVG y points down
+  if (!xs.length) {
+    svg.setAttribute("viewBox", "0 0 100 60");
+    el("text", { x: 50, y: 30, class: "empty", "font-size": 4 }, trackLayer).textContent = "Track outline not available yet";
+    span = 100;
+    return;
+  }
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  span = Math.max(maxX - minX, maxY - minY);
+  const pad = span * 0.07;
+  svg.setAttribute("viewBox", `${minX - pad} ${minY - pad} ${maxX - minX + 2 * pad} ${maxY - minY + 2 * pad}`);
+  const d = xs.map((x, i) => `${i ? "L" : "M"}${x},${ys[i]}`).join(" ");
+  const common = { d, fill: "none", "stroke-linejoin": "round", "stroke-linecap": "round" };
+  el("path", { ...common, stroke: "#3a3d46", "stroke-width": span * 0.024 }, trackLayer);
+  el("path", { ...common, stroke: "#1b1d24", "stroke-width": span * 0.014 }, trackLayer);
+  // Start/finish line across the track at the first point.
+  const [x0, y0, x1, y1] = [xs[0], ys[0], xs[1] ?? xs[0], ys[1] ?? ys[0]];
+  const len = Math.hypot(x1 - x0, y1 - y0) || 1;
+  const nx = -(y1 - y0) / len * span * 0.02, ny = (x1 - x0) / len * span * 0.02;
+  el("line", { x1: x0 - nx, y1: y0 - ny, x2: x0 + nx, y2: y0 + ny, stroke: "#ffffff", "stroke-width": span * 0.004 }, trackLayer);
+  for (const key of Object.keys(els)) { els[key].g.remove(); delete els[key]; }
+}
+
+function carElement(num) {
+  if (els[num]) return els[num];
+  const g = el("g", {}, carLayer);
+  const r = span * 0.012;
+  const dot = el("circle", { r, stroke: "#0b0c10", "stroke-width": span * 0.003 }, g);
+  const label = el("text", { y: -r * 1.6, class: "label", "font-size": span * 0.024, "stroke-width": span * 0.005 }, g);
+  const title = el("title", {}, g);
+  els[num] = { g, dot, label, title };
+  return els[num];
+}
+
+// Position of one car at time t, linearly interpolated between samples.
+function positionAt(c, t) {
+  const ts = c.t, n = ts.length;
+  if (!n || t < ts[0] - 1) return null;
+  if (t <= ts[0]) return [c.x[0], c.y[0]];
+  if (t >= ts[n - 1]) return t - ts[n - 1] < 8 ? [c.x[n - 1], c.y[n - 1]] : null;
+  let lo = 0, hi = n - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (ts[mid] <= t) lo = mid; else hi = mid;
+  }
+  const gap = ts[hi] - ts[lo];
+  if (gap > 3) return [c.x[lo], c.y[lo]];            // missing data: don't slide across the infield
+  const f = gap > 0 ? (t - ts[lo]) / gap : 0;
+  return [c.x[lo] + (c.x[hi] - c.x[lo]) * f, c.y[lo] + (c.y[hi] - c.y[lo]) * f];
+}
+
+function draw() {
+  for (const num of Object.keys(meta)) {
+    const c = cars[num];
+    const e = carElement(num);
+    const p = c ? positionAt(c, playhead) : null;
+    if (!p) { e.g.style.display = "none"; continue; }
+    e.g.style.display = "";
+    e.g.setAttribute("transform", `translate(${p[0]},${-p[1]})`);
+  }
+}
+
+function onRender(a) {
+  if (a.outline_key !== outlineKey) { setOutline(a.outline); outlineKey = a.outline_key; }
+  cars = a.cars || {};
+  meta = a.meta || {};
+  horizon = a.horizon;
+
+  // Remove cars that left the session, style and stack the rest (leader on top).
+  for (const num of Object.keys(els)) if (!meta[num]) { els[num].g.remove(); delete els[num]; }
+  const order = Object.keys(meta).sort((p, q) => meta[q].pos - meta[p].pos);
+  for (const num of order) {
+    const e = carElement(num), m = meta[num];
+    e.dot.setAttribute("fill", m.colour);
+    e.label.textContent = m.label;
+    e.title.textContent = m.title;
+    carLayer.appendChild(e.g);
+  }
+
+  const diff = a.playhead - playhead;
+  if (a.seek_id !== seekId || a.rate === 0 || Math.abs(diff) > a.tolerance) {
+    playhead = a.playhead;   // seek, pause or big drift: jump to the server's time
+    adjust = 1;
+  } else {
+    // Small drift: speed up or slow down a little instead of jumping.
+    adjust = 1 + Math.max(-0.25, Math.min(0.25, diff / Math.max(a.rate * 2, 0.5)));
+  }
+  seekId = a.seek_id;
+  rate = a.rate;
+
+  if (a.height !== height) {
+    height = a.height;
+    svg.setAttribute("height", height);
+    post("streamlit:setFrameHeight", { height });
+  }
+  draw();
+}
+
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.5);
+  last = now;
+  if (rate > 0) playhead = Math.min(playhead + dt * rate * adjust, horizon);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+window.addEventListener("message", event => {
+  if (event.data && event.data.type === "streamlit:render") onRender(event.data.args);
+});
+post("streamlit:componentReady", { apiVersion: 1 });
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

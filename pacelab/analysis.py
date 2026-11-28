@@ -73,8 +73,50 @@ def short_run_table(laps: pd.DataFrame) -> pd.DataFrame:
     out.insert(0, "pos", range(1, len(out) + 1))
     out["gap"] = out["best_lap"] - out["best_lap"].iloc[0]
     out["ideal_gap"] = out["ideal_lap"] - out["ideal_lap"].min()
-    for col, sector in zip(("s1", "s2", "s3"), SECTORS):
+    for n, (col, sector) in enumerate(zip(("s1", "s2", "s3"), SECTORS), start=1):
         out[f"{col}_gap"] = out[col] - out[col].min()
+        # Sector times of the best lap itself, coloured like the F1 timing screen.
+        lap_sector = out["driver_number"].map(best[sector])
+        out[f"lap_s{n}"] = lap_sector
+        out[f"lap_s{n}_status"] = [
+            sector_colour(value, own_best, out[col].min())
+            for value, own_best in zip(lap_sector, out[col])
+        ]
+    return out
+
+
+def sector_colour(value: float, personal_best: float, overall_best: float) -> str:
+    """'purple' = fastest of anyone, 'green' = driver's own best, 'yellow' = slower."""
+    if pd.isna(value):
+        return ""
+    if pd.notna(overall_best) and np.isclose(value, overall_best):
+        return "purple"
+    if pd.notna(personal_best) and np.isclose(value, personal_best):
+        return "green"
+    return "yellow"
+
+
+def sector_leaderboard(laps: pd.DataFrame, sector: int) -> pd.DataFrame:
+    """Each driver's best time in one sector (1-3), fastest first."""
+    clean = clean_laps(laps)
+    col = SECTORS[sector - 1]
+    clean = clean[clean[col].notna()]
+    if clean.empty:
+        return pd.DataFrame()
+    best = clean.loc[clean.groupby("driver_number")[col].idxmin()]
+    out = pd.DataFrame(
+        {
+            "driver_number": best["driver_number"],
+            "driver": best["name_acronym"],
+            "team": best["team_name"],
+            "team_colour": best["team_colour"],
+            "time": best[col],
+            "compound": best["compound"],
+            "tyre_age": best["tyre_age"],
+            "lap_number": best["lap_number"],
+        }
+    ).sort_values("time").reset_index(drop=True)
+    out["gap"] = out["time"] - out["time"].iloc[0]
     return out
 
 
@@ -133,6 +175,7 @@ def long_run_table(run_laps: pd.DataFrame) -> pd.DataFrame:
         rows.append(
             {
                 "run_id": run_id,
+                "driver_number": int(first["driver_number"]),
                 "driver": first["name_acronym"],
                 "team": first["team_name"],
                 "team_colour": first["team_colour"],
@@ -161,7 +204,7 @@ def team_long_run_ranking(runs: pd.DataFrame) -> pd.DataFrame:
     best["gap"] = best["avg_corrected"] - best.groupby("compound")["avg_corrected"].transform("min")
     best["rank"] = best.groupby("compound").cumcount() + 1
     return best[
-        ["compound", "rank", "team", "driver", "laps", "avg_corrected", "gap", "deg_s_per_lap", "team_colour"]
+        ["compound", "rank", "team", "driver_number", "driver", "laps", "avg_corrected", "gap", "deg_s_per_lap", "team_colour"]
     ].reset_index(drop=True)
 
 
